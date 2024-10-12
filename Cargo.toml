@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    ".",
-    "bench"
-]
+members = [".", "bench"]
 
 [package]
 name = "thingbuf"
@@ -31,13 +28,21 @@ pin-project = "1"
 parking_lot = { version = "0.12", optional = true, default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.14.0", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.14.0", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+] }
 # So that we can use `poll_fn` in tests.
 futures-util = { version = "0.3", default-features = false }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = { version = "0.5.6", features = ["checkpoint", "futures"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "std",
+  "fmt",
+] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # Custom profile for Loom tests: enable release optimizations so that the loom
@@ -53,3 +58,9 @@ loom = { git = "https://github.com/tokio-rs/loom", rev = "a93bf2390e0fcfdb7c5899
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(loom)',
+  'cfg(thingbuf_trace)',
+] }
