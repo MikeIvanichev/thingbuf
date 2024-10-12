@@ -8,7 +8,7 @@ mod inner {
         pub use std::sync::atomic::Ordering;
     }
 
-    pub(crate) use loom::{cell, future, hint, sync, thread};
+    pub(crate) use loom::{cell, future, hint, sync, thread, thread_local};
     use std::{cell::RefCell, fmt::Write};
 
     pub(crate) mod model {
@@ -214,7 +214,7 @@ mod inner {
     pub(crate) use core::sync::atomic;
 
     #[cfg(feature = "std")]
-    pub use std::thread;
+    pub use std::{thread, thread_local};
 
     pub(crate) mod hint {
         #[inline(always)]

@@ -10,6 +10,7 @@ mod macros;
 mod loom;
 pub mod mpsc;
 pub mod recycling;
+mod thread_waker;
 mod util;
 mod wait;
 
