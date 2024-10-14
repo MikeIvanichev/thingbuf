@@ -63,4 +63,5 @@ rustdoc-args = ["--cfg", "docsrs"]
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(loom)',
   'cfg(thingbuf_trace)',
+  'cfg(ci_skip_slow_models)',
 ] }
