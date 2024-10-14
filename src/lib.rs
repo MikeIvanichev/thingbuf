@@ -10,6 +10,7 @@ mod macros;
 mod loom;
 pub mod mpsc;
 pub mod recycling;
+#[cfg(feature = "std")]
 mod thread_waker;
 mod util;
 mod wait;
