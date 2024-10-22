@@ -144,6 +144,126 @@ feature! {
             .await
         }
 
+        /// Reserves a slot in the channel to mutate in place, blocking until
+        /// there is a free slot to write to.
+        ///
+        /// This is similar to the [`blocking_send`] method, but, rather than taking a
+        /// message by value to write to the channel, this method reserves a
+        /// writable slot in the channel, and returns a [`SendRef`] that allows
+        /// mutating the slot in place. If the [`Receiver`] end of the channel
+        /// uses the [`Receiver::recv_ref`], [`Receiver::blocking_recv_ref`]
+        /// or [`Receiver::poll_recv_ref`] method for receiving from the channel,
+        /// this allows allocations for channel messages to be reused in place.
+        ///
+        /// # Errors
+        ///
+        /// If the [`Receiver`] end of the channel has been dropped, this
+        /// returns a [`Closed`] error.
+        ///
+        /// # Examples
+        ///
+        /// Sending formatted strings by writing them directly to channel slots,
+        /// in place:
+        /// ```
+        /// use thingbuf::mpsc;
+        /// use std::{fmt::Write, thread};
+        ///
+        /// #[tokio::main]
+        /// async fn main() {
+        ///     let (tx, rx) = mpsc::channel::<String>(8);
+        ///
+        ///     // Spawn a thread that writes formatted messages to the channel until it closes.
+        ///     thread::spawn( move || {
+        ///         let mut count = 1;
+        ///         while let Ok(mut value) = tx.blocking_send_ref() {
+        ///             // Writing to the `SendRef` will reuse the *existing* string
+        ///             // allocation in place.
+        ///             write!(value, "hello from message {}", count)
+        ///                 .expect("writing to a `String` should never fail");
+        ///             count += 1;
+        ///         }
+        ///     });
+        ///
+        ///     // Print each message received from the channel:
+        ///     for _ in 0..10 {
+        ///         let msg = rx.recv_ref().await.unwrap();
+        ///         println!("{}", msg);
+        ///     }
+        /// }
+        /// ```
+        /// [`blocking_send`]: Self::blocking_send
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        pub fn blocking_send_ref(&self) -> Result<SendRef<'_, T>, Closed> {
+            blocking_send_ref(&self.inner.core, self.inner.slots.as_ref(), &self.inner.recycle)
+        }
+
+
+        /// Reserves a slot in the channel to mutate in place, blocking until
+        /// there is a free slot to write to, waiting for at most `timeout`.
+        ///
+        /// This is similar to the [`blocking_send_timeout`] method, but, rather than taking a
+        /// message by value to write to the channel, this method reserves a
+        /// writable slot in the channel, and returns a [`SendRef`] that allows
+        /// mutating the slot in place. If the [`Receiver`] end of the channel
+        /// uses the [`Receiver::recv_ref`] method for receiving from the channel,
+        /// this allows allocations for channel messages to be reused in place.
+        ///
+        /// # Errors
+        ///
+        /// - [`Err`]`(`[`SendTimeoutError::Timeout`]`)` if the timeout has elapsed.
+        /// - [`Err`]`(`[`SendTimeoutError::Closed`]`)` if the channel has closed.
+        ///
+        /// # Examples
+        ///
+        /// Sending formatted strings by writing them directly to channel slots,
+        /// in place:
+        ///
+        /// ```
+        /// use thingbuf::mpsc::{self, errors::SendTimeoutError};
+        /// use std::{fmt::Write, time::Duration, thread};
+        ///
+        /// #[tokio::main]
+        /// async fn main() {
+        ///     let (tx, rx) = mpsc::channel::<String>(1);
+        ///
+        ///     tokio::spawn(async move {
+        ///         tokio::time::sleep(Duration::from_millis(500));
+        ///         let msg = rx.recv_ref().await.unwrap();
+        ///         println!("{}", msg);
+        ///         tokio::time::sleep(Duration::from_millis(500));
+        ///     });
+        ///
+        ///     thread::spawn(move || {
+        ///         let mut value = tx.blocking_send_ref_timeout(Duration::from_millis(200)).unwrap();
+        ///         write!(value, "hello").expect("writing to a `String` should never fail");
+        ///         thread::sleep(Duration::from_millis(400));
+        ///
+        ///         let mut value = tx.blocking_send_ref_timeout(Duration::from_millis(200)).unwrap();
+        ///         write!(value, "world").expect("writing to a `String` should never fail");
+        ///         thread::sleep(Duration::from_millis(400));
+        ///
+        ///         assert_eq!(
+        ///             Err(&SendTimeoutError::Timeout(())),
+        ///             tx.blocking_send_ref_timeout(Duration::from_millis(200)).as_deref().map(String::as_str)
+        ///         );
+        ///     });
+        /// }
+        /// ```
+        ///
+        /// [`blocking_send_timeout`]: Self::blocking_send_timeout
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        #[cfg(not(all(test, loom)))]
+        pub fn blocking_send_ref_timeout(&self, timeout: Duration) -> Result<SendRef<'_, T>, SendTimeoutError> {
+            blocking_send_ref_timeout(
+                &self.inner.core,
+                self.inner.slots.as_ref(),
+                &self.inner.recycle,
+                timeout,
+            )
+        }
+
         /// Sends a message by value, waiting until there is a free slot to
         /// write to.
         ///
@@ -191,6 +311,129 @@ feature! {
         pub async fn send(&self, val: T) -> Result<(), Closed<T>> {
             match self.send_ref().await {
                 Err(Closed(())) => Err(Closed(val)),
+                Ok(mut slot) => {
+                    *slot = val;
+                    Ok(())
+                }
+            }
+        }
+
+        /// Sends a message by value, blocking until there is a free slot to
+        /// write to.
+        ///
+        /// This method takes the message by value, and replaces any previous
+        /// value in the slot. This means that the channel will *not* function
+        /// as an object pool while sending messages with `blocking_send`. This method is
+        /// most appropriate when messages don't own reusable heap allocations,
+        /// or when the [`Receiver`] end of the channel must receive messages by
+        /// moving them out of the channel by value (using the [`Receiver::recv`]
+        /// or [`Receiver::blocking_recv`] method). When messages in the channel own
+        /// reusable heap allocations (such as `String`s or `Vec`s), and the
+        /// [`Receiver`] doesn't need to receive them by value, consider using
+        /// [`send_ref`][Self::send_ref] or [`blocking_send_ref`] instead, to enable allocation reuse.
+        ///
+        /// # Errors
+        ///
+        /// If the [`Receiver`] end of the channel has been dropped, this
+        /// returns a [`Closed`] error containing the sent value.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use thingbuf::mpsc;
+        /// use std::thread;
+        ///
+        /// #[tokio::main]
+        /// async fn main() {
+        ///     let (tx, rx) = mpsc::channel(8);
+        ///
+        ///     // Spawn a thread that writes the current iteration to the channel until it closes.
+        ///     thread::spawn( move || {
+        ///         let mut count = 1;
+        ///         while tx.blocking_send(count).is_ok() {
+        ///             count += 1;
+        ///         }
+        ///     });
+        ///
+        ///     // Print each message received from the channel:
+        ///     for _ in 0..10 {
+        ///         let msg = rx.recv().await.unwrap();
+        ///         println!("received message {}", msg);
+        ///     }
+        /// }
+        /// ```
+        /// [`blocking_send_ref`]: Self::blocking_send_ref
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        pub fn blocking_send(&self, val: T) -> Result<(), Closed<T>> {
+            match self.blocking_send_ref() {
+                Err(Closed(())) => Err(Closed(val)),
+                Ok(mut slot) => {
+                    *slot = val;
+                    Ok(())
+                }
+            }
+        }
+
+        /// Sends a message by value, blocking until there is a free slot to
+        /// write to, for at most `timeout`.
+        ///
+        /// This method takes the message by value, and replaces any previous
+        /// value in the slot. This means that the channel will *not* function
+        /// as an object pool while sending messages with `send_timeout`. This method is
+        /// most appropriate when messages don't own reusable heap allocations,
+        /// or when the [`Receiver`] end of the channel must receive messages by
+        /// moving them out of the channel by value (using the
+        /// [`Receiver::recv`] method). When messages in the channel own
+        /// reusable heap allocations (such as `String`s or `Vec`s), and the
+        /// [`Receiver`] doesn't need to receive them by value, consider using
+        /// [`blocking_send_ref_timeout`] instead, to enable allocation reuse.
+        ///
+        ///
+        /// # Errors
+        ///
+        /// - [`Err`]`(`[`SendTimeoutError::Timeout`]`)` if the timeout has elapsed.
+        /// - [`Err`]`(`[`SendTimeoutError::Closed`]`)` if the channel has closed.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use thingbuf::mpsc::{self, errors::SendTimeoutError};
+        /// use std::{time::Duration, thread};
+        ///
+        /// #[tokio::main]
+        /// async fn main() {
+        ///     let (tx, rx) = mpsc::channel(1);
+        ///
+        ///     tokio::spawn(async move {
+        ///         tokio::time::sleep(Duration::from_millis(500));
+        ///         let msg = rx.recv().await.unwrap();
+        ///         println!("{}", msg);
+        ///         tokio::time::sleep(Duration::from_millis(500));
+        ///     });
+        ///
+        ///     thread::spawn(move || {
+        ///         tx.blocking_send_timeout(1, Duration::from_millis(200)).unwrap();
+        ///         thread::sleep(Duration::from_millis(400));
+        ///
+        ///         tx.blocking_send_timeout(2, Duration::from_millis(200)).unwrap();
+        ///         thread::sleep(Duration::from_millis(400));
+        ///
+        ///         assert_eq!(
+        ///             Err(SendTimeoutError::Timeout(3)),
+        ///             tx.blocking_send_timeout(3, Duration::from_millis(200))
+        ///         );
+        ///     });
+        /// }
+        /// ```
+        ///
+        /// [`blocking_send_ref_timeout`]: Self::blocking_send_ref_timeout
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        #[cfg(not(all(test, loom)))]
+        pub fn blocking_send_timeout(&self, val: T, timeout: Duration) -> Result<(), SendTimeoutError<T>> {
+            match self.blocking_send_ref_timeout(timeout) {
+                Err(e) => Err(e.with_value(val)),
                 Ok(mut slot) => {
                     *slot = val;
                     Ok(())
@@ -471,6 +714,12 @@ feature! {
             }
         }
 
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        pub fn blocking_recv_ref(&self) -> Option<RecvRef<'_, T>> {
+            blocking_recv_ref(&self.inner.core, self.inner.slots.as_ref())
+        }
+
         /// Receives the next message for this receiver, **by value**.
         ///
         /// This method returns `None` if the channel has been closed and there are
@@ -538,6 +787,16 @@ feature! {
                 slots: self.inner.slots.as_ref(),
                 recycle: &self.inner.recycle,
             }
+        }
+
+        #[cfg(feature = "std")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+        pub fn blocking_recv(&self) -> Option<T>
+        where
+            R: Recycle<T>,
+        {
+            let mut val = self.blocking_recv_ref()?;
+            Some(recycling::take(&mut *val, &self.inner.recycle))
         }
 
         /// Attempts to receive the next message for this receiver by reference
@@ -1975,6 +2234,169 @@ impl<T, R> PinnedDrop for SendRefFuture<'_, T, R> {
         let this = self.project();
         if test_dbg!(*this.state) == State::Waiting && test_dbg!(this.waiter.is_linked()) {
             this.waiter.remove(&this.core.tx_wait)
+        }
+    }
+}
+
+// === impl blocking Fns ===
+
+feature! {
+    #![feature = "std"]
+
+    use crate::thread_waker;
+    use crate::util::Backoff;
+    use crate::loom::thread;
+    use std::time::{Duration, Instant};
+
+    #[inline]
+    fn blocking_send_ref<'a, T, R: Recycle<T>>(
+        core: &'a ChannelCore<Waker>,
+        slots: &'a [Slot<T>],
+        recycle: &'a R,
+    ) -> Result<SendRef<'a, T>, Closed<()>> {
+        match core.try_send_ref(slots, recycle) {
+            Ok(slot) => return Ok(SendRef(slot)),
+            Err(TrySendError::Closed(_)) => return Err(Closed(())),
+            _ => {}
+        }
+        let mut waiter = queue::Waiter::new();
+        let mut unqueued = true;
+        let waker = thread_waker::current();
+        let mut boff = Backoff::new();
+        loop {
+            let node = unsafe { Pin::new_unchecked(&mut waiter) };
+            let wait = if unqueued {
+                test_dbg!(core.tx_wait.start_wait(node, &waker))
+            } else {
+                test_dbg!(core.tx_wait.continue_wait(node, &waker))
+            };
+            match wait {
+                WaitResult::Closed => return Err(Closed(())),
+                WaitResult::Notified => {
+                    boff.spin_yield();
+                    match core.try_send_ref(slots.as_ref(), recycle) {
+                        Ok(slot) => return Ok(SendRef(slot)),
+                        Err(TrySendError::Closed(_)) => return Err(Closed(())),
+                        _ => {}
+                    }
+                }
+                WaitResult::Wait => {
+                    unqueued = false;
+                    thread::park();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(all(test, loom)))]
+    #[inline]
+    fn blocking_send_ref_timeout<'a, T, R: Recycle<T>>(
+        core: &'a ChannelCore<Waker>,
+        slots: &'a [Slot<T>],
+        recycle: &'a R,
+        timeout: Duration,
+    ) -> Result<SendRef<'a, T>, SendTimeoutError> {
+        // fast path: avoid getting the thread and constructing the node if the
+        // slot is immediately ready.
+        match core.try_send_ref(slots, recycle) {
+            Ok(slot) => return Ok(SendRef(slot)),
+            Err(TrySendError::Closed(_)) => return Err(SendTimeoutError::Closed(())),
+            _ => {}
+        }
+
+        let mut waiter = queue::Waiter::new();
+        let mut unqueued = true;
+        let thread = thread_waker::current();
+        let mut boff = Backoff::new();
+        let beginning_park = Instant::now();
+        loop {
+            let node = unsafe {
+                // Safety: in this case, it's totally safe to pin the waiter, as
+                // it is owned uniquely by this function, and it cannot possibly
+                // be moved while this thread is parked.
+                Pin::new_unchecked(&mut waiter)
+            };
+
+            let wait = if unqueued {
+                test_dbg!(core.tx_wait.start_wait(node, &thread))
+            } else {
+                test_dbg!(core.tx_wait.continue_wait(node, &thread))
+            };
+
+            match wait {
+                WaitResult::Closed => return Err(SendTimeoutError::Closed(())),
+                WaitResult::Notified => {
+                    boff.spin_yield();
+                    match core.try_send_ref(slots.as_ref(), recycle) {
+                        Ok(slot) => return Ok(SendRef(slot)),
+                        Err(TrySendError::Closed(_)) => return Err(SendTimeoutError::Closed(())),
+                        _ => {}
+                    }
+                }
+                WaitResult::Wait => {
+                    unqueued = false;
+                    thread::park_timeout(timeout);
+                    let elapsed = beginning_park.elapsed();
+                    if elapsed >= timeout {
+                        return Err(SendTimeoutError::Timeout(()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn blocking_recv_ref<'a, T>(
+        core: &'a ChannelCore<Waker>,
+        slots: &'a [Slot<T>],
+    ) -> Option<RecvRef<'a, T>> {
+        loop {
+            match core.poll_recv_ref(slots, crate::thread_waker::current) {
+                Poll::Ready(r) => {
+                    return r.map(|slot| {
+                        RecvRef(RecvRefInner {
+                            _notify: super::NotifyTx(&core.tx_wait),
+                            slot,
+                        })
+                    })
+                }
+                Poll::Pending => {
+                    test_println!("parking ({:?})", crate::loom::thread::current());
+                    crate::loom::thread::park();
+                }
+            }
+        }
+    }
+
+    #[cfg(not(all(test, loom)))]
+    #[inline]
+    fn blocking_recv_ref_timeout<'a, T>(
+        core: &'a ChannelCore<Waker>,
+        slots: &'a [Slot<T>],
+        timeout: Duration,
+    ) -> Result<RecvRef<'a, T>, RecvTimeoutError> {
+        let beginning_park = Instant::now();
+        loop {
+            match core.poll_recv_ref(slots, thread_waker::current) {
+                Poll::Ready(r) => {
+                    return r
+                        .map(|slot| {
+                            RecvRef(RecvRefInner {
+                                _notify: super::NotifyTx(&core.tx_wait),
+                                slot,
+                            })
+                        })
+                        .ok_or(RecvTimeoutError::Closed);
+                }
+                Poll::Pending => {
+                    test_println!("park_timeout ({:?})", thread::current());
+                    thread::park_timeout(timeout);
+                    let elapsed = beginning_park.elapsed();
+                    if elapsed >= timeout {
+                        return Err(RecvTimeoutError::Timeout);
+                    }
+                }
+            }
         }
     }
 }
